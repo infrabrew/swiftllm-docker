@@ -1,0 +1,42 @@
+# ==============================================================================
+# SWIFTLLM — docker-compose DEV overlay ("dynamic" workflow)
+# ------------------------------------------------------------------------------
+# Overlays docker-compose.yml to enable edit-locally → rebuild-in-place.
+# The local source is bind-mounted into the container; Rust/Cargo caches live
+# in named volumes so rebuilds are fast and incremental.
+#
+#     docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#     # edit code on the host, then:
+#     docker compose -f docker-compose.yml -f docker-compose.dev.yml exec swiftllm rebuild
+#     docker compose -f docker-compose.yml -f docker-compose.dev.yml restart swiftllm
+#
+# (swiftllmctl --dev up   and   swiftllmctl rebuild   do all of this for you.)
+# ==============================================================================
+name: swiftllm
+
+services:
+  swiftllm:
+    image: swiftllm:dev
+    build:
+      target: devel
+    container_name: swiftllm-dev
+    volumes:
+      # Live source from the host (edits are visible immediately).
+      - ..:/opt/swiftllm/src
+      # Keep Linux build artifacts OUT of the host tree (arch mismatch) and
+      # cache them across rebuilds for speed.
+      - swiftllm-target:/opt/swiftllm/src/target
+      - swiftllm-cargo-registry:/opt/cargo/registry
+      - swiftllm-cargo-git:/opt/cargo/git
+      - swiftllm-models:/models
+    environment:
+      SWIFTLLM_SRC: /opt/swiftllm/src
+      SWIFTLLM_FEATURES: ${SWIFTLLM_FEATURES:-cuda}
+
+volumes:
+  swiftllm-target:
+    name: swiftllm-target
+  swiftllm-cargo-registry:
+    name: swiftllm-cargo-registry
+  swiftllm-cargo-git:
+    name: swiftllm-cargo-git

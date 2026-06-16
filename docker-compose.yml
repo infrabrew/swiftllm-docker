@@ -1,0 +1,74 @@
+# ==============================================================================
+# SWIFTLLM — docker-compose (production / GPU)
+# ------------------------------------------------------------------------------
+# Run from this docker/ directory:
+#     cp .env.example .env      # edit SWIFTLLM_MODEL etc.
+#     docker compose up -d --build
+#
+# OS is selected via .env (SWIFTLLM_DOCKERFILE / SWIFTLLM_IMAGE) — the
+# swiftllmctl wrapper flips these for you with --ubuntu / --rhel.
+#
+# Requires the NVIDIA Container Toolkit on the host for GPU access.
+# ==============================================================================
+name: swiftllm
+
+services:
+  swiftllm:
+    image: ${SWIFTLLM_IMAGE:-swiftllm:ubuntu-2.0.0}
+    build:
+      context: ..
+      dockerfile: ${SWIFTLLM_DOCKERFILE:-docker/Dockerfile.ubuntu}
+      target: ${SWIFTLLM_TARGET:-runtime}
+      args:
+        CUDA_VERSION: ${CUDA_VERSION:-12.4.1}
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-22.04}
+        UBI_VERSION: ${UBI_VERSION:-ubi9}
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.10}
+        SWIFTLLM_FEATURES: ${SWIFTLLM_FEATURES:-cuda}
+        CUDA_ARCHITECTURES: ${CUDA_ARCHITECTURES:-80;86;89;90}
+        BUILD_LLAMA: ${BUILD_LLAMA:-1}
+        RUST_VERSION: ${RUST_VERSION:-stable}
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}
+        TORCH_SPEC: ${TORCH_SPEC:-torch torchvision}
+        SWIFTLLM_UID: ${SWIFTLLM_UID:-1000}
+        SWIFTLLM_GID: ${SWIFTLLM_GID:-1000}
+        SWIFTLLM_GIT_URL: ${SWIFTLLM_GIT_URL:-}
+        SWIFTLLM_GIT_REF: ${SWIFTLLM_GIT_REF:-}
+    container_name: swiftllm
+    restart: unless-stopped
+    init: true
+    command: ["serve"]
+    ports:
+      - "${SWIFTLLM_HOST_PORT:-8000}:${SWIFTLLM_PORT:-8000}"
+    environment:
+      SWIFTLLM_MODEL: ${SWIFTLLM_MODEL:-}
+      SWIFTLLM_HOST: ${SWIFTLLM_HOST:-0.0.0.0}
+      SWIFTLLM_PORT: ${SWIFTLLM_PORT:-8000}
+      SWIFTLLM_MODEL_DIR: ${SWIFTLLM_MODEL_DIR:-/models}
+      SWIFTLLM_TENSOR_PARALLEL_SIZE: ${SWIFTLLM_TENSOR_PARALLEL_SIZE:-}
+      SWIFTLLM_GPU_MEMORY_UTILIZATION: ${SWIFTLLM_GPU_MEMORY_UTILIZATION:-}
+      SWIFTLLM_MAX_MODEL_LEN: ${SWIFTLLM_MAX_MODEL_LEN:-}
+      SWIFTLLM_QUANTIZATION: ${SWIFTLLM_QUANTIZATION:-}
+      SWIFTLLM_DTYPE: ${SWIFTLLM_DTYPE:-}
+      SWIFTLLM_TRUST_REMOTE_CODE: ${SWIFTLLM_TRUST_REMOTE_CODE:-}
+      SWIFTLLM_ENABLE_PREFIX_CACHING: ${SWIFTLLM_ENABLE_PREFIX_CACHING:-}
+      SWIFTLLM_SERVE_ARGS: ${SWIFTLLM_SERVE_ARGS:-}
+      SWIFTLLM_API_KEY: ${SWIFTLLM_API_KEY:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    volumes:
+      # Persistent model cache. Swap for a host path if you prefer:
+      #   - /data/swiftllm/models:/models
+      - swiftllm-models:/models
+    # ---- GPU access (NVIDIA Container Toolkit) -------------------------------
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  swiftllm-models:
+    name: swiftllm-models

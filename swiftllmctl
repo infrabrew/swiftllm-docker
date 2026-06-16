@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# PROJECT:   SWIFTLLM
+# FILE:      docker/swiftllmctl
+# AUTHOR:    Peter A. Aldrich Jr.
+# ------------------------------------------------------------------------------
+# One command to build, run, update and remove the SwiftLLM containers.
+# Wraps docker / docker compose so you don't have to remember long flag soups.
+#
+#   ./swiftllmctl build            # build the image (Ubuntu GPU by default)
+#   ./swiftllmctl up               # start the API server (detached)
+#   ./swiftllmctl --rhel up        # ... using the RHEL/UBI9 image
+#   ./swiftllmctl --cpu up         # ... CPU-only (no GPU required)
+#   ./swiftllmctl --dev up         # dynamic dev mode (edit code, rebuild fast)
+#   ./swiftllmctl update           # pull latest source + rebuild + restart
+#   ./swiftllmctl update --ref v2.0.1   # build a specific published tag
+#   ./swiftllmctl logs -f          # follow logs
+#   ./swiftllmctl status           # container + health status
+#   ./swiftllmctl chat -m <model>  # one-shot interactive chat
+#   ./swiftllmctl uninstall        # stop + remove image (keeps models)
+#   ./swiftllmctl uninstall --purge# remove EVERYTHING incl. model volume
+#
+# Run `./swiftllmctl help` for the full list.
+# Licensed under the Apache License, Version 2.0
+# ==============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ENV_FILE="$SCRIPT_DIR/.env"
+VERSION_TAG="2.0.0"
+
+# colors
+C='\033[0;36m'; G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; B='\033[1m'; N='\033[0m'
+info(){ echo -e "${C}[swiftllmctl]${N} $*"; }
+ok(){   echo -e "${G}[ok]${N} $*"; }
+warn(){ echo -e "${Y}[warn]${N} $*"; }
+die(){  echo -e "${R}[fail]${N} $*" >&2; exit 1; }
+
+# ----------------------------------------------------------------------------
+# Global flags (must come before the subcommand)
+# ----------------------------------------------------------------------------
+OS=""          # ubuntu | rhel  (empty = use .env / default ubuntu)
+MODE="prod"    # prod | dev
+ACCEL="gpu"    # gpu | cpu
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --ubuntu) OS="ubuntu"; shift ;;
+        --rhel)   OS="rhel";   shift ;;
+        --dev)    MODE="dev";  shift ;;
+        --prod)   MODE="prod"; shift ;;
+        --cpu)    ACCEL="cpu"; shift ;;
+        --gpu)    ACCEL="gpu"; shift ;;
+        --env-file) ENV_FILE="$2"; shift 2 ;;
+        -h|--help|help) CMD="help"; shift; break ;;
+        --) shift; break ;;
+        -*) die "Unknown global flag: $1 (put subcommand flags after the verb)" ;;
+        *)  break ;;
+    esac
+done
+
+CMD="${CMD:-${1:-help}}"
+[[ $# -gt 0 ]] && shift || true   # drop the subcommand; "$@" now = its args
+
+# ----------------------------------------------------------------------------
+# Load .env (for OS default + image names). Compose reads it again itself.
+# ----------------------------------------------------------------------------
+if [[ -f "$ENV_FILE" ]]; then
+    set -a; # shellcheck disable=SC1090
+    source "$ENV_FILE"; set +a
+fi
+[[ -z "$OS" ]] && OS="${SWIFTLLM_OS:-ubuntu}"
+
+# ----------------------------------------------------------------------------
+# Resolve OS-specific defaults
+# ----------------------------------------------------------------------------
+case "$OS" in
+    ubuntu)
+        export SWIFTLLM_DOCKERFILE="docker/Dockerfile.ubuntu"
+        export PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
+        DEFAULT_IMAGE="swiftllm:ubuntu-${VERSION_TAG}"
+        ;;
+    rhel)
+        export SWIFTLLM_DOCKERFILE="docker/Dockerfile.rhel"
+        export PYTHON_VERSION="3.11"
+        DEFAULT_IMAGE="swiftllm:rhel-${VERSION_TAG}"
+        ;;
+    *) die "Unknown OS '$OS' (use --ubuntu or --rhel)" ;;
+esac
+export SWIFTLLM_IMAGE="${SWIFTLLM_IMAGE:-$DEFAULT_IMAGE}"
+[[ "$MODE" == "dev" ]] && export SWIFTLLM_TARGET="devel" || export SWIFTLLM_TARGET="${SWIFTLLM_TARGET:-runtime}"
+
+# ----------------------------------------------------------------------------
+# Compose file stack + helpers
+# ----------------------------------------------------------------------------
+COMPOSE_FILES=(-f "$SCRIPT_DIR/docker-compose.yml")
+[[ "$MODE"  == "dev" ]] && COMPOSE_FILES+=(-f "$SCRIPT_DIR/docker-compose.dev.yml")
+[[ "$ACCEL" == "cpu" ]] && COMPOSE_FILES+=(-f "$SCRIPT_DIR/docker-compose.cpu.yml")
+
+have_compose() { docker compose version >/dev/null 2>&1; }
+dc() {
+    have_compose || die "'docker compose' not found. Install Docker Compose v2."
+    local ef=(); [[ -f "$ENV_FILE" ]] && ef=(--env-file "$ENV_FILE")
+    ( cd "$SCRIPT_DIR" && docker compose "${ef[@]}" "${COMPOSE_FILES[@]}" "$@" )
+}
+
+# Raw `docker run` for one-shot tasks (guarantees --gpus all in GPU mode).
+GPU_FLAG=(); [[ "$ACCEL" == "gpu" ]] && GPU_FLAG=(--gpus all)
+TTY_FLAG=(); [[ -t 0 ]] && TTY_FLAG=(-it)
+drun() {
+    local img="$SWIFTLLM_IMAGE"
+    [[ "$MODE" == "dev" ]] && img="swiftllm:dev"
+    docker image inspect "$img" >/dev/null 2>&1 || die "Image '$img' not found — run: $0 build"
+    docker run --rm "${TTY_FLAG[@]}" "${GPU_FLAG[@]}" \
+        -v swiftllm-models:/models \
+        -e SWIFTLLM_MODEL_DIR=/models \
+        -e HF_TOKEN="${HF_TOKEN:-}" \
+        -e SWIFTLLM_API_KEY="${SWIFTLLM_API_KEY:-}" \
+        -e NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES:-all}" \
+        "$img" "$@"
+}
+
+show_config() {
+    info "OS=${OS}  mode=${MODE}  accel=${ACCEL}"
+    info "image=${SWIFTLLM_IMAGE}  target=${SWIFTLLM_TARGET}  dockerfile=${SWIFTLLM_DOCKERFILE}"
+}
+
+# ----------------------------------------------------------------------------
+# Subcommands
+# ----------------------------------------------------------------------------
+case "$CMD" in
+    build)
+        show_config
+        info "Building image (first GPU build can take 15–40 min: Rust + CUDA + torch)..."
+        dc build "$@"
+        ok "Built ${SWIFTLLM_IMAGE}"
+        ;;
+
+    up|start)
+        show_config
+        [[ -f "$ENV_FILE" ]] || warn "No $ENV_FILE — using defaults. Copy .env.example to .env to configure."
+        dc up -d "$@"
+        ok "Server starting. Health: curl http://localhost:${SWIFTLLM_HOST_PORT:-8000}/health"
+        info "Follow logs:  $0 logs -f"
+        ;;
+
+    down|stop)
+        dc down "$@"
+        ok "Stopped."
+        ;;
+
+    restart) dc restart "$@"; ok "Restarted." ;;
+    logs)    if [[ $# -eq 0 ]]; then dc logs --tail=100; else dc logs "$@"; fi ;;
+    ps)      dc ps "$@" ;;
+    exec)    dc exec swiftllm "$@" ;;
+
+    status)
+        dc ps
+        echo
+        local_id=$(dc ps -q swiftllm 2>/dev/null || true)
+        if [[ -n "${local_id:-}" ]]; then
+            info "Health: $(docker inspect --format '{{.State.Health.Status}}' "$local_id" 2>/dev/null || echo 'n/a')"
+        fi
+        ;;
+
+    shell)   drun shell "$@" ;;
+    chat)    drun swiftllm chat "$@" ;;
+    generate) drun swiftllm generate "$@" ;;
+    download) drun swiftllm download "$@" ;;
+    run)     drun "$@" ;;
+
+    version)
+        show_config
+        drun python -c "import swiftllm; print('SwiftLLM', swiftllm.__version__)" 2>/dev/null \
+            || warn "Build the image first: $0 build"
+        ;;
+
+    rebuild)
+        # Dynamic in-place rebuild from mounted source (dev mode only).
+        [[ "$MODE" == "dev" ]] || die "rebuild is for --dev mode. Use: $0 --dev rebuild  (prod: use 'update')"
+        info "Rebuilding in place from mounted source..."
+        dc exec swiftllm rebuild
+        dc restart swiftllm
+        ok "Rebuilt and restarted."
+        ;;
+
+    update)
+        REF=""; NO_PULL=false
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --ref) REF="$2"; shift 2 ;;
+                --no-pull) NO_PULL=true; shift ;;
+                *) die "update: unknown option $1" ;;
+            esac
+        done
+        show_config
+        if [[ "$MODE" == "dev" ]]; then
+            info "Dev mode → in-place rebuild."
+            dc exec swiftllm rebuild && dc restart swiftllm && ok "Updated (dev)."
+            exit 0
+        fi
+        if [[ -n "$REF" ]]; then
+            ORIGIN=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || echo "https://github.com/infrabrew/swiftllm")
+            info "Building published ref '$REF' from $ORIGIN"
+            export SWIFTLLM_GIT_URL="$ORIGIN" SWIFTLLM_GIT_REF="$REF"
+        elif ! $NO_PULL && [[ -d "$REPO_DIR/.git" ]]; then
+            info "Pulling latest source in $REPO_DIR ..."
+            git -C "$REPO_DIR" pull --ff-only || warn "git pull failed (continuing with current source)"
+        fi
+        info "Rebuilding image..."
+        dc build
+        info "Recreating container..."
+        dc up -d --force-recreate
+        ok "Updated. New version: $(drun python -c 'import swiftllm;print(swiftllm.__version__)' 2>/dev/null || echo '?')"
+        ;;
+
+    airgap-save)  "$SCRIPT_DIR/airgap/build-airgap.sh" --os "$OS" "$@" ;;
+    airgap-load)  "$SCRIPT_DIR/airgap/load-airgap.sh" "$@" ;;
+
+    uninstall)
+        PURGE=false
+        for a in "$@"; do [[ "$a" == "--purge" ]] && PURGE=true; done
+        info "Stopping and removing containers..."
+        dc down --remove-orphans 2>/dev/null || true
+        info "Removing images..."
+        for img in "swiftllm:ubuntu-${VERSION_TAG}" "swiftllm:rhel-${VERSION_TAG}" "swiftllm:dev" "${SWIFTLLM_IMAGE}"; do
+            docker image rm -f "$img" 2>/dev/null && ok "removed image $img" || true
+        done
+        if $PURGE; then
+            warn "Purging volumes (this DELETES downloaded models)..."
+            for v in swiftllm-models swiftllm-target swiftllm-cargo-registry swiftllm-cargo-git; do
+                docker volume rm "$v" 2>/dev/null && ok "removed volume $v" || true
+            done
+        else
+            info "Kept model volume 'swiftllm-models'. Use --purge to delete it too."
+        fi
+        ok "Uninstalled."
+        ;;
+
+    help|*)
+        cat <<EOF
+$(echo -e "${B}SwiftLLM Docker control${N}")  —  manage the Ubuntu/RHEL GPU containers
+
+USAGE
+  ./swiftllmctl [GLOBAL FLAGS] <command> [args]
+
+GLOBAL FLAGS
+  --ubuntu        Use the Ubuntu image (default)
+  --rhel          Use the RHEL/UBI9 image
+  --dev           Dynamic dev mode: bind-mount source, fast in-place rebuilds
+  --cpu           CPU-only (no GPU required)
+  --gpu           Force GPU (default)
+  --env-file F    Use a specific env file (default: docker/.env)
+
+COMMANDS
+  build                 Build the image
+  up                    Start the API server (detached)
+  down                  Stop and remove the container
+  restart               Restart the server
+  logs [-f]             Show / follow logs
+  status                Container + health status
+  update [--ref TAG]    Pull latest (or a tag) → rebuild → recreate
+  rebuild               (--dev) Rebuild in place from mounted source + restart
+  shell                 Open a shell in a throwaway container
+  chat -m <model>       One-shot interactive chat
+  generate -m <model> -p "..."   One-shot generation
+  download -m <model>   Pre-download a model into the model volume
+  run -- <args>         Run arbitrary args in the image (with --gpus)
+  version               Print the installed SwiftLLM version
+  airgap-save           Build an offline image bundle (see airgap/)
+  airgap-load FILE      Load an offline bundle on an air-gapped host
+  uninstall [--purge]   Remove container + image (+ volumes with --purge)
+
+EXAMPLES
+  cp docker/.env.example docker/.env && \$EDITOR docker/.env
+  ./swiftllmctl build && ./swiftllmctl up && ./swiftllmctl logs -f
+  ./swiftllmctl --rhel up
+  ./swiftllmctl --dev up      # then edit code, then:  ./swiftllmctl --dev rebuild
+  ./swiftllmctl update --ref v2.0.1
+EOF
+        ;;
+esac

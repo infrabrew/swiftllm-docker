@@ -1,0 +1,235 @@
+# ==============================================================================
+# PROJECT:   SWIFTLLM
+# FILE:      docker/Dockerfile.ubuntu
+# AUTHOR:    Peter A. Aldrich Jr.
+# ------------------------------------------------------------------------------
+# Ubuntu + NVIDIA CUDA image for SwiftLLM.
+#
+# Multi-stage / multi-target:
+#   builder  – CUDA *devel* base: Rust + maturin + nvcc. Builds the wheels.
+#   runtime  – CUDA *runtime* base: slim, production. (DEFAULT target)
+#   devel    – CUDA *devel* base: keeps the toolchain for in-place rebuilds
+#              (used by the "dynamic" dev workflow / docker-compose.dev.yml).
+#
+# Everything that changes between releases is an ARG, so updating is just a
+# rebuild with new --build-arg values — no Dockerfile edits required.
+#
+#   docker build -f docker/Dockerfile.ubuntu --target runtime -t swiftllm:ubuntu .
+#   docker build -f docker/Dockerfile.ubuntu --target devel   -t swiftllm:ubuntu-dev .
+# Licensed under the Apache License, Version 2.0
+# ==============================================================================
+
+# ---- Global build arguments (override with --build-arg) -----------------------
+ARG CUDA_VERSION=12.4.1
+ARG UBUNTU_VERSION=22.04
+ARG PYTHON_VERSION=3.10
+
+# ==============================================================================
+# Stage 1: builder — compile the Rust core + Python wheel (+ CUDA GGUF backend)
+# ==============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+
+ARG PYTHON_VERSION
+# Build features: "cuda" (GPU) or "cpu". GPU is the default.
+ARG SWIFTLLM_FEATURES=cuda
+# GPU architectures for the CUDA GGUF backend (match crates/.../build.rs).
+# Ampere(80) GA10x/RTX30(86) Ada/RTX40(89) Hopper/H100(90).
+# Blackwell/RTX50 (120) needs CUDA 13+ and is intentionally omitted here.
+ARG CUDA_ARCHITECTURES=80;86;89;90
+# Build the CUDA-accelerated llama-cpp-python (GGUF) backend. 0 = skip (faster).
+ARG BUILD_LLAMA=1
+# Rust toolchain version ("stable" or a pinned version like "1.82.0").
+ARG RUST_VERSION=stable
+# Where to get the source: empty = use the local build context (this repo).
+# Set SWIFTLLM_GIT_URL to clone a remote repo instead.
+ARG SWIFTLLM_GIT_URL=""
+ARG SWIFTLLM_GIT_REF=""
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_HOME=/opt/cargo \
+    RUSTUP_HOME=/opt/rustup \
+    PATH=/opt/cargo/bin:/usr/local/cuda/bin:$PATH \
+    CUDA_HOME=/usr/local/cuda \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# System build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
+        python3-pip \
+        build-essential cmake pkg-config libssl-dev \
+        git curl ca-certificates patchelf \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python \
+    && python3 -m pip install --upgrade pip setuptools wheel \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain (rustup, non-interactive)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
+    && rustc --version && cargo --version
+
+# Python build tool
+RUN python3 -m pip install "maturin>=1.4,<2.0"
+
+WORKDIR /build
+
+# Bring in the source. Default: the local repo (build context). This is what
+# makes updates easy — edit locally, rebuild. Optionally pull a remote/pinned ref.
+COPY . /build/src
+RUN set -eux; \
+    if [ -n "${SWIFTLLM_GIT_URL}" ]; then \
+        rm -rf /build/src; \
+        git clone "${SWIFTLLM_GIT_URL}" /build/src; \
+        cd /build/src && git checkout "${SWIFTLLM_GIT_REF:-HEAD}"; \
+    elif [ -n "${SWIFTLLM_GIT_REF}" ] && [ -d /build/src/.git ]; then \
+        cd /build/src && git checkout "${SWIFTLLM_GIT_REF}"; \
+    fi
+
+# Build the SwiftLLM wheel (Rust core + Python bindings) via maturin.
+WORKDIR /build/src
+RUN set -eux; \
+    mkdir -p /wheels; \
+    maturin build --release --no-default-features --features "${SWIFTLLM_FEATURES}" \
+        --out /wheels; \
+    ls -lh /wheels
+
+# Build the GGUF backend (llama-cpp-python). With CUDA when features=cuda.
+RUN set -eux; \
+    if [ "${BUILD_LLAMA}" = "1" ]; then \
+        if [ "${SWIFTLLM_FEATURES}" = "cuda" ]; then \
+            export CUDACXX=/usr/local/cuda/bin/nvcc; \
+            export CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}"; \
+            echo "Building llama-cpp-python WITH CUDA (arch=${CUDA_ARCHITECTURES})"; \
+        else \
+            echo "Building llama-cpp-python (CPU)"; \
+        fi; \
+        python3 -m pip wheel "llama-cpp-python>=0.3.8" --no-deps -w /wheels; \
+    else \
+        echo "Skipping llama-cpp-python build (BUILD_LLAMA=0)"; \
+    fi; \
+    ls -lh /wheels
+
+# ==============================================================================
+# Stage 2: runtime — slim production image (CUDA runtime, no compilers)
+# ==============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+
+ARG PYTHON_VERSION
+ARG SWIFTLLM_FEATURES=cuda
+# PyTorch wheel index. cu124 = CUDA 12.4 build. Use .../whl/cpu for CPU images.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
+ARG TORCH_SPEC="torch torchvision"
+# Non-root runtime user (set to your host UID/GID for clean bind-mount perms).
+ARG SWIFTLLM_UID=1000
+ARG SWIFTLLM_GID=1000
+
+LABEL org.opencontainers.image.title="SwiftLLM" \
+      org.opencontainers.image.description="High-performance LLM inference engine (Ubuntu/CUDA)" \
+      org.opencontainers.image.source="https://github.com/infrabrew/swiftllm" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    SWIFTLLM_HOST=0.0.0.0 \
+    SWIFTLLM_PORT=8000 \
+    SWIFTLLM_MODEL_DIR=/models \
+    HF_HOME=/models/.hf
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} python3-pip \
+        libgomp1 curl ca-certificates \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python \
+    && python3 -m pip install --upgrade pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install PyTorch first (from the matching CUDA/CPU index), then the wheels.
+RUN python3 -m pip install --index-url "${TORCH_INDEX_URL}" ${TORCH_SPEC}
+
+COPY --from=builder /wheels /tmp/wheels
+RUN set -eux; \
+    SWHL="$(ls /tmp/wheels/swiftllm-*.whl | head -1)"; \
+    python3 -m pip install "${SWHL}[serve]"; \
+    if ls /tmp/wheels/llama_cpp_python-*.whl >/dev/null 2>&1; then \
+        python3 -m pip install /tmp/wheels/llama_cpp_python-*.whl; \
+    fi; \
+    python3 -m pip install "kernels>=0.14.0,<0.15" || echo "kernels optional — skipped"; \
+    if [ "${SWIFTLLM_FEATURES}" = "cuda" ]; then \
+        python3 -m pip install bitsandbytes || echo "bitsandbytes optional — skipped"; \
+    fi; \
+    rm -rf /tmp/wheels
+
+# Non-root user + data dir
+RUN groupadd -g "${SWIFTLLM_GID}" swiftllm \
+    && useradd -m -u "${SWIFTLLM_UID}" -g "${SWIFTLLM_GID}" -s /bin/bash swiftllm \
+    && mkdir -p /models && chown -R swiftllm:swiftllm /models
+
+COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+USER swiftllm
+WORKDIR /home/swiftllm
+VOLUME ["/models"]
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=5 \
+    CMD curl -fsS "http://localhost:${SWIFTLLM_PORT}/health" || exit 1
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["serve"]
+
+# ==============================================================================
+# Stage 3: devel — toolchain kept, for the "dynamic" in-place rebuild workflow
+# ==============================================================================
+FROM builder AS devel
+
+ARG SWIFTLLM_FEATURES=cuda
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
+ARG TORCH_SPEC="torch torchvision"
+
+ENV PYTHONUNBUFFERED=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    SWIFTLLM_HOST=0.0.0.0 \
+    SWIFTLLM_PORT=8000 \
+    SWIFTLLM_MODEL_DIR=/models \
+    HF_HOME=/models/.hf \
+    SWIFTLLM_SRC=/opt/swiftllm/src \
+    SWIFTLLM_FEATURES=${SWIFTLLM_FEATURES}
+
+# Install torch + the freshly built wheels so the devel image can serve as-is.
+RUN set -eux; \
+    python3 -m pip install --index-url "${TORCH_INDEX_URL}" ${TORCH_SPEC}; \
+    SWHL="$(ls /wheels/swiftllm-*.whl | head -1)"; \
+    python3 -m pip install "${SWHL}[serve]"; \
+    (ls /wheels/llama_cpp_python-*.whl >/dev/null 2>&1 \
+            && python3 -m pip install /wheels/llama_cpp_python-*.whl || true); \
+    python3 -m pip install "kernels>=0.14.0,<0.15" || true
+
+# Keep a copy of the source where the entrypoint's "rebuild" expects it.
+# In dynamic mode this path is bind-mounted to your working copy on the host.
+RUN mkdir -p /opt/swiftllm && cp -a /build/src /opt/swiftllm/src
+RUN mkdir -p /models
+
+COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+WORKDIR /opt/swiftllm/src
+VOLUME ["/models"]
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=5 \
+    CMD curl -fsS "http://localhost:${SWIFTLLM_PORT}/health" || exit 1
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["serve"]
+
+# ------------------------------------------------------------------------------
+# END OF FILE: docker/Dockerfile.ubuntu
+# (c) 2026 SWIFTLLM | Apache 2.0 License
+# ------------------------------------------------------------------------------

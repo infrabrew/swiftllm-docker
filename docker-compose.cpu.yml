@@ -1,0 +1,25 @@
+# ==============================================================================
+# SWIFTLLM — docker-compose CPU overlay
+# ------------------------------------------------------------------------------
+# Overlays docker-compose.yml to drop the NVIDIA GPU reservation and build a
+# CPU-only image (no CUDA kernels, CPU PyTorch). Useful for laptops/CI or hosts
+# without an NVIDIA GPU.
+#
+#     docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d --build
+#     # (swiftllmctl --cpu ...  applies this for you)
+# ==============================================================================
+name: swiftllm
+
+services:
+  swiftllm:
+    build:
+      args:
+        SWIFTLLM_FEATURES: cpu
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+    # Replace the GPU reservation with an empty device list (no GPU required).
+    deploy:
+      resources:
+        reservations:
+          devices: []
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "void"

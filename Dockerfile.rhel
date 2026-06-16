@@ -1,0 +1,207 @@
+# ==============================================================================
+# PROJECT:   SWIFTLLM
+# FILE:      docker/Dockerfile.rhel
+# AUTHOR:    Peter A. Aldrich Jr.
+# ------------------------------------------------------------------------------
+# RHEL-compatible + NVIDIA CUDA image for SwiftLLM.
+#
+# Built on NVIDIA's UBI9 CUDA images (Red Hat Universal Base Image 9 — binary
+# compatible with RHEL 9, freely redistributable, no subscription needed).
+# To build on entitled RHEL instead, swap the FROM lines for your registry's
+# CUDA-on-RHEL images; the rest is identical.
+#
+# Multi-stage / multi-target: builder | runtime (DEFAULT) | devel
+#   docker build -f docker/Dockerfile.rhel --target runtime -t swiftllm:rhel .
+#   docker build -f docker/Dockerfile.rhel --target devel   -t swiftllm:rhel-dev .
+# Licensed under the Apache License, Version 2.0
+# ==============================================================================
+
+ARG CUDA_VERSION=12.4.1
+ARG UBI_VERSION=ubi9
+ARG PYTHON_VERSION=3.11
+
+# ==============================================================================
+# Stage 1: builder
+# ==============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBI_VERSION} AS builder
+
+ARG PYTHON_VERSION
+ARG SWIFTLLM_FEATURES=cuda
+ARG CUDA_ARCHITECTURES=80;86;89;90
+ARG BUILD_LLAMA=1
+ARG RUST_VERSION=stable
+ARG SWIFTLLM_GIT_URL=""
+ARG SWIFTLLM_GIT_REF=""
+
+ENV CARGO_HOME=/opt/cargo \
+    RUSTUP_HOME=/opt/rustup \
+    PATH=/opt/cargo/bin:/usr/local/cuda/bin:$PATH \
+    CUDA_HOME=/usr/local/cuda \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# System build dependencies (dnf)
+RUN dnf install -y --setopt=install_weak_deps=False \
+        python${PYTHON_VERSION} python${PYTHON_VERSION}-devel python${PYTHON_VERSION}-pip \
+        gcc gcc-c++ make cmake openssl-devel pkgconfig \
+        git curl ca-certificates \
+    && (dnf install -y patchelf || echo "patchelf not in repos — maturin will proceed without it") \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python \
+    && python3 -m pip install --upgrade pip setuptools wheel \
+    && dnf clean all
+
+# Rust toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
+    && rustc --version && cargo --version
+
+RUN python3 -m pip install "maturin>=1.4,<2.0"
+
+WORKDIR /build
+COPY . /build/src
+RUN set -eux; \
+    if [ -n "${SWIFTLLM_GIT_URL}" ]; then \
+        rm -rf /build/src; \
+        git clone "${SWIFTLLM_GIT_URL}" /build/src; \
+        cd /build/src && git checkout "${SWIFTLLM_GIT_REF:-HEAD}"; \
+    elif [ -n "${SWIFTLLM_GIT_REF}" ] && [ -d /build/src/.git ]; then \
+        cd /build/src && git checkout "${SWIFTLLM_GIT_REF}"; \
+    fi
+
+WORKDIR /build/src
+RUN set -eux; \
+    mkdir -p /wheels; \
+    maturin build --release --no-default-features --features "${SWIFTLLM_FEATURES}" \
+        --out /wheels; \
+    ls -lh /wheels
+
+RUN set -eux; \
+    if [ "${BUILD_LLAMA}" = "1" ]; then \
+        if [ "${SWIFTLLM_FEATURES}" = "cuda" ]; then \
+            export CUDACXX=/usr/local/cuda/bin/nvcc; \
+            export CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}"; \
+            echo "Building llama-cpp-python WITH CUDA (arch=${CUDA_ARCHITECTURES})"; \
+        else \
+            echo "Building llama-cpp-python (CPU)"; \
+        fi; \
+        python3 -m pip wheel "llama-cpp-python>=0.3.8" --no-deps -w /wheels; \
+    else \
+        echo "Skipping llama-cpp-python build (BUILD_LLAMA=0)"; \
+    fi; \
+    ls -lh /wheels
+
+# ==============================================================================
+# Stage 2: runtime — slim production image
+# ==============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBI_VERSION} AS runtime
+
+ARG PYTHON_VERSION
+ARG SWIFTLLM_FEATURES=cuda
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
+ARG TORCH_SPEC="torch torchvision"
+ARG SWIFTLLM_UID=1000
+ARG SWIFTLLM_GID=1000
+
+LABEL org.opencontainers.image.title="SwiftLLM" \
+      org.opencontainers.image.description="High-performance LLM inference engine (RHEL/UBI9/CUDA)" \
+      org.opencontainers.image.source="https://github.com/infrabrew/swiftllm" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    SWIFTLLM_HOST=0.0.0.0 \
+    SWIFTLLM_PORT=8000 \
+    SWIFTLLM_MODEL_DIR=/models \
+    HF_HOME=/models/.hf
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        python${PYTHON_VERSION} python${PYTHON_VERSION}-pip \
+        libgomp curl ca-certificates shadow-utils \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python \
+    && python3 -m pip install --upgrade pip \
+    && dnf clean all
+
+RUN python3 -m pip install --index-url "${TORCH_INDEX_URL}" ${TORCH_SPEC}
+
+COPY --from=builder /wheels /tmp/wheels
+RUN set -eux; \
+    SWHL="$(ls /tmp/wheels/swiftllm-*.whl | head -1)"; \
+    python3 -m pip install "${SWHL}[serve]"; \
+    if ls /tmp/wheels/llama_cpp_python-*.whl >/dev/null 2>&1; then \
+        python3 -m pip install /tmp/wheels/llama_cpp_python-*.whl; \
+    fi; \
+    python3 -m pip install "kernels>=0.14.0,<0.15" || echo "kernels optional — skipped"; \
+    if [ "${SWIFTLLM_FEATURES}" = "cuda" ]; then \
+        python3 -m pip install bitsandbytes || echo "bitsandbytes optional — skipped"; \
+    fi; \
+    rm -rf /tmp/wheels
+
+RUN groupadd -g "${SWIFTLLM_GID}" swiftllm \
+    && useradd -m -u "${SWIFTLLM_UID}" -g "${SWIFTLLM_GID}" -s /bin/bash swiftllm \
+    && mkdir -p /models && chown -R swiftllm:swiftllm /models
+
+COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+USER swiftllm
+WORKDIR /home/swiftllm
+VOLUME ["/models"]
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=5 \
+    CMD curl -fsS "http://localhost:${SWIFTLLM_PORT}/health" || exit 1
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["serve"]
+
+# ==============================================================================
+# Stage 3: devel — toolchain kept, for the "dynamic" in-place rebuild workflow
+# ==============================================================================
+FROM builder AS devel
+
+ARG SWIFTLLM_FEATURES=cuda
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
+ARG TORCH_SPEC="torch torchvision"
+
+ENV PYTHONUNBUFFERED=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    SWIFTLLM_HOST=0.0.0.0 \
+    SWIFTLLM_PORT=8000 \
+    SWIFTLLM_MODEL_DIR=/models \
+    HF_HOME=/models/.hf \
+    SWIFTLLM_SRC=/opt/swiftllm/src \
+    SWIFTLLM_FEATURES=${SWIFTLLM_FEATURES}
+
+RUN set -eux; \
+    python3 -m pip install --index-url "${TORCH_INDEX_URL}" ${TORCH_SPEC}; \
+    SWHL="$(ls /wheels/swiftllm-*.whl | head -1)"; \
+    python3 -m pip install "${SWHL}[serve]"; \
+    (ls /wheels/llama_cpp_python-*.whl >/dev/null 2>&1 \
+            && python3 -m pip install /wheels/llama_cpp_python-*.whl || true); \
+    python3 -m pip install "kernels>=0.14.0,<0.15" || true
+
+RUN mkdir -p /opt/swiftllm && cp -a /build/src /opt/swiftllm/src && mkdir -p /models
+
+COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+WORKDIR /opt/swiftllm/src
+VOLUME ["/models"]
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=5 \
+    CMD curl -fsS "http://localhost:${SWIFTLLM_PORT}/health" || exit 1
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["serve"]
+
+# ------------------------------------------------------------------------------
+# END OF FILE: docker/Dockerfile.rhel
+# (c) 2026 SWIFTLLM | Apache 2.0 License
+# ------------------------------------------------------------------------------
