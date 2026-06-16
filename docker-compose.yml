@@ -69,6 +69,40 @@ services:
               count: all
               capabilities: [gpu]
 
+  # ==========================================================================
+  # One-shot training / dataset jobs (GPU). Behind the "train" profile, so a
+  # plain `docker compose up` does NOT start it. Reuses the image built by the
+  # `swiftllm` service — build that first (`docker compose build` / swiftllmctl).
+  #
+  #   docker compose run --rm trainer \
+  #       swiftllm train -m <model> --train-data /data/train.jsonl -o /models/runs/exp1
+  #   docker compose run --rm trainer swiftllm dataset --help
+  #
+  # Datasets: drop files in ./data (or set SWIFTLLM_DATA_HOST). Write checkpoints
+  # under /models (the persistent volume the container user can write to).
+  #
+  # NOTE: swiftllm's training backend is currently a SIMULATED stub — this runs
+  # the CLI / config / checkpoint plumbing, not real gradient updates.
+  # ==========================================================================
+  trainer:
+    profiles: ["train"]
+    image: ${SWIFTLLM_IMAGE:-swiftllm:ubuntu-2.0.0}
+    environment:
+      SWIFTLLM_MODEL_DIR: ${SWIFTLLM_MODEL_DIR:-/models}
+      HF_TOKEN: ${HF_TOKEN:-}
+      SWIFTLLM_API_KEY: ${SWIFTLLM_API_KEY:-}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    volumes:
+      - swiftllm-models:/models                  # checkpoints / output (writable)
+      - ${SWIFTLLM_DATA_HOST:-./data}:/data      # your datasets (host directory)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
 volumes:
   swiftllm-models:
     name: swiftllm-models

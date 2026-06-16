@@ -33,9 +33,10 @@ docker/
 6. [Air-gapped install / update / uninstall](#6-air-gapped-install--update--uninstall)
 7. [Configuration reference](#7-configuration-reference)
 8. [Using plain docker compose (no wrapper)](#8-using-plain-docker-compose-no-wrapper)
-9. [GPU / CPU notes](#9-gpu--cpu-notes)
-10. [Security notes](#10-security-notes)
-11. [Troubleshooting](#11-troubleshooting)
+9. [Training & dataset jobs](#9-training--dataset-jobs-trainer-service)
+10. [GPU / CPU notes](#10-gpu--cpu-notes)
+11. [Security notes](#11-security-notes)
+12. [Troubleshooting](#12-troubleshooting)
 
 ---
 
@@ -285,7 +286,59 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml exec swiftllm reb
 
 ---
 
-## 9. GPU / CPU notes
+## 9. Training & dataset jobs (`trainer` service)
+
+> ⚠️ **swiftllm's training backend is currently a simulated stub.** The
+> `train` / `finetune` / `grpo` commands run the CLI, config, logging and
+> checkpoint plumbing but do **not** load weights or compute gradients
+> (`Trainer.train()` is marked `[SIMULATED]` in
+> [`python/swiftllm/training.py`](../python/swiftllm/training.py)). Dataset
+> **ingestion** (`swiftllm dataset …`) is real. The rest of this section is the
+> Docker mechanics for running these jobs.
+
+Training is a **one-shot job**, not the long-running server, so the tool is
+`docker compose run` (which overrides the service's default `serve` command).
+
+**A. Quick — reuse the existing `swiftllm` service**
+```bash
+cd docker
+# datasets in ./data ; write checkpoints to /models (persistent volume)
+docker compose run --rm -v "$PWD/data:/data" swiftllm \
+  swiftllm train -m <model> --train-data /data/train.jsonl -o /models/runs/exp1
+```
+`run` replaces `serve` with your command and reuses the image, env, GPU and the
+`swiftllm-models` volume; `--rm` removes the one-off container on exit.
+
+**B. Repeatable — the dedicated `trainer` service** (behind the `train` profile,
+so a plain `docker compose up` never starts it):
+```bash
+cd docker
+# datasets go in ./data  (or set SWIFTLLM_DATA_HOST=/abs/path in .env)
+docker compose run --rm trainer \
+  swiftllm train -m <model> --train-data /data/train.jsonl -o /models/runs/exp1
+docker compose run --rm trainer swiftllm dataset --help      # ingestion (real)
+```
+…or via the wrapper, which targets the same service:
+```bash
+./swiftllmctl train   -m <model> --train-data /data/train.jsonl -o /models/runs/exp1
+./swiftllmctl dataset --help
+```
+
+**Notes**
+- **Build the image first** (`./swiftllmctl build` or `docker compose up -d --build`) —
+  the `trainer` service reuses that image; it has no build block of its own.
+- **GPU on `run`:** current Docker Compose attaches the service's reserved GPUs to
+  `run` containers. If `nvidia-smi` shows nothing inside, add `--gpus all`
+  (e.g. `docker compose run --rm --gpus all trainer …`).
+- **Where to write output:** the container runs as a non-root user (uid 1000) that
+  owns `/models`, so write checkpoints under `/models/...`. `/data` is your host
+  dir — to write there too, make it writable by uid 1000 (or set
+  `SWIFTLLM_UID`/`SWIFTLLM_GID` at build time to match your host user).
+- **Multi-GPU:** pass `-tp <N>` or set `SWIFTLLM_TENSOR_PARALLEL_SIZE`.
+
+---
+
+## 10. GPU / CPU notes
 
 - **GPU is the default.** `docker-compose.yml` reserves all NVIDIA GPUs and the
   CUDA runtime ships inside the image. Limit GPUs with
@@ -300,7 +353,7 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml exec swiftllm reb
 
 ---
 
-## 10. Security notes
+## 11. Security notes
 
 - The image runs as a **non-root** user (`swiftllm`, uid/gid `1000` — override
   with `SWIFTLLM_UID`/`SWIFTLLM_GID` to match a bind-mount owner).
@@ -314,7 +367,7 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml exec swiftllm reb
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 | Symptom | Fix |
 |---|---|

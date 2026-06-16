@@ -170,6 +170,11 @@ case "$CMD" in
     download) drun swiftllm download "$@" ;;
     run)     drun "$@" ;;
 
+    # One-shot GPU jobs via the compose "trainer" service (mounts /models + /data).
+    # NOTE: swiftllm training is currently a simulated stub (no real gradients).
+    train)    dc run --rm trainer swiftllm train "$@" ;;
+    dataset)  dc run --rm trainer swiftllm dataset "$@" ;;
+
     version)
         show_config
         drun python -c "import swiftllm; print('SwiftLLM', swiftllm.__version__)" 2>/dev/null \
@@ -267,10 +272,15 @@ COMMANDS
   generate -m <model> -p "..."   One-shot generation
   download -m <model>   Pre-download a model into the model volume
   run -- <args>         Run arbitrary args in the image (with --gpus)
+  train <args>          One-shot training job (compose "trainer", /models + /data)*
+  dataset <args>        One-shot dataset ingestion job (compose "trainer")
   version               Print the installed SwiftLLM version
   airgap-save           Build an offline image bundle (see airgap/)
   airgap-load FILE      Load an offline bundle on an air-gapped host
   uninstall [--purge]   Remove container + image (+ volumes with --purge)
+
+  * swiftllm's training backend is currently a SIMULATED stub — train/dataset run
+    the CLI + plumbing, not real gradient updates. See docs/README "Training".
 
 EXAMPLES
   cp docker/.env.example docker/.env && \$EDITOR docker/.env
@@ -278,6 +288,7 @@ EXAMPLES
   ./swiftllmctl --rhel up
   ./swiftllmctl --dev up      # then edit code, then:  ./swiftllmctl --dev rebuild
   ./swiftllmctl update --ref v2.0.1
+  ./swiftllmctl train -m <model> --train-data /data/train.jsonl -o /models/runs/exp1
 EOF
         ;;
 esac
